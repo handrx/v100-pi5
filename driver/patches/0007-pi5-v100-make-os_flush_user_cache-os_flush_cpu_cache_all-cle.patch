@@ -1,0 +1,163 @@
+From 4f88bf960842c0abe5b91f8049467c4ea9dad8c4 Mon Sep 17 00:00:00 2001
+From: handrx <287708+handrx@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 20:40:04 +0100
+Subject: [PATCH] pi5-v100: make os_flush_user_cache/os_flush_cpu_cache_all
+ clean+invalidate registered user pages
+
+On arm64 both map to flush_cache_all(), which does not exist, so libcuda's
+NV0000_CTRL_CMD_OS_UNIX_FLUSH_USER_CACHE around pageable copies flushed nothing
+and the copy engine read stale DRAM from the /dev/zero staging buffers (~1.4%
+of 64B lines wrong on pageable H2D). Track nv_register_user_pages allocations
+and DC CIVAC every page by VA.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/inc/nv-linux.h |  3 ++
+ nvidia/nv.c           | 69 +++++++++++++++++++++++++++++++++++++++++++
+ nvidia/os-interface.c |  8 +++++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/common/inc/nv-linux.h b/common/inc/nv-linux.h
+index 3bb05f6..9eacf10 100644
+--- a/common/inc/nv-linux.h
++++ b/common/inc/nv-linux.h
+@@ -968,6 +968,8 @@ typedef struct nv_alloc_s {
+     } flags;
+     unsigned int   cache_type;
+     unsigned int   pi5_req_cache;   /* pi5-v100: cache type RM asked for */
++    struct list_head pi5_user_node; /* pi5-v100: on nv_pi5_user_allocs while registered */
++    NvBool         pi5_on_list;
+     unsigned int   num_pages;
+     unsigned int   order;
+     unsigned int   size;
+@@ -1753,6 +1755,7 @@ extern int nv_pi5_no_iomap_wc;
+ extern int nv_pi5_debug;
+ int  nv_pi5_uvm_mark(void);
+ void nv_pi5_uvm_unmark(int slot);
++unsigned long nv_pi5_flush_user_pages(void);
+ #define nv_pi5_disable_iomap_wc() (nv_pi5_no_iomap_wc || rm_disable_iomap_wc())
+ 
+ #endif  /* _NV_LINUX_H_ */
+diff --git a/nvidia/nv.c b/nvidia/nv.c
+index 67f1b4d..61b2c33 100644
+--- a/nvidia/nv.c
++++ b/nvidia/nv.c
+@@ -90,6 +90,71 @@ void nv_pi5_uvm_unmark(int slot)
+         WRITE_ONCE(nv_pi5_uvm_tasks[slot], NULL);
+ }
+ 
++/*
++ * pi5-v100: user pages registered with RM (OS descriptors: libcuda's pageable-copy
++ * staging buffers, cuMemHostRegister). They stay mapped write-back in the process,
++ * so libcuda asks RM to flush them around each copy (NV0000_CTRL_CMD_OS_UNIX_FLUSH_USER_CACHE
++ * -> os_flush_user_cache). On arm64 the stock glue maps that to flush_cache_all(), which
++ * does not exist, so nothing was flushed and the copy engine read stale DRAM. Clean +
++ * invalidate every registered page by VA instead (DC CIVAC: a concurrent CPU write is
++ * never lost, unlike a clean followed by a separate invalidate).
++ */
++static LIST_HEAD(nv_pi5_user_allocs);
++static DEFINE_MUTEX(nv_pi5_user_lock);
++
++static void nv_pi5_user_track(nv_alloc_t *at)
++{
++    mutex_lock(&nv_pi5_user_lock);
++    list_add(&at->pi5_user_node, &nv_pi5_user_allocs);
++    at->pi5_on_list = NV_TRUE;
++    mutex_unlock(&nv_pi5_user_lock);
++}
++
++static void nv_pi5_user_untrack(nv_alloc_t *at)
++{
++    if (!at->pi5_on_list)
++        return;
++    mutex_lock(&nv_pi5_user_lock);
++    list_del(&at->pi5_user_node);
++    at->pi5_on_list = NV_FALSE;
++    mutex_unlock(&nv_pi5_user_lock);
++}
++
++/* Returns the number of pages flushed. Caller must be able to sleep. */
++unsigned long nv_pi5_flush_user_pages(void)
++{
++#if defined(NVCPU_AARCH64)
++    nv_alloc_t *at;
++    unsigned long pages = 0;
++    NvU64 i;
++
++    mutex_lock(&nv_pi5_user_lock);
++    list_for_each_entry(at, &nv_pi5_user_allocs, pi5_user_node)
++    {
++        for (i = 0; i < at->num_pages; i++)
++        {
++            unsigned long pfn = at->page_table[i].phys_addr >> PAGE_SHIFT;
++            unsigned long va, end;
++
++            if (!pfn_valid(pfn))
++                continue;
++            va = (unsigned long)page_address(pfn_to_page(pfn));
++            for (end = va + PAGE_SIZE; va < end; va += 64)
++                asm volatile("dc civac, %0" : : "r" (va) : "memory");
++            pages++;
++        }
++    }
++    asm volatile("dsb sy" : : : "memory");
++    mutex_unlock(&nv_pi5_user_lock);
++
++    if (nv_pi5_debug > 1)
++        printk_ratelimited(KERN_INFO "NVRM: pi5dbg: user flush %lu pages\n", pages);
++    return pages;
++#else
++    return 0;
++#endif
++}
++
+ static NvBool nv_pi5_in_uvm_call(void)
+ {
+     int i;
+@@ -3457,6 +3522,8 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     /* Save off the user pages array to be restored later */
+     at->user_pages = user_pages;
+ 
++    nv_pi5_user_track(at);
++
+     /* Save off the import private data to be returned later */
+     if (import_priv != NULL)
+     {
+@@ -3485,6 +3552,8 @@ void NV_API_CALL nv_unregister_user_pages(
+ 
+     WARN_ON(!at->flags.user);
+ 
++    nv_pi5_user_untrack(at);
++
+     /* Restore the user pages array for the caller to handle */
+     *priv_data = at->user_pages;
+ 
+diff --git a/nvidia/os-interface.c b/nvidia/os-interface.c
+index 2648eb2..bb0dc94 100644
+--- a/nvidia/os-interface.c
++++ b/nvidia/os-interface.c
+@@ -994,6 +994,9 @@ static inline void nv_flush_cache_cpu(void *info)
+ // flush the cache of all cpus
+ NV_STATUS NV_API_CALL os_flush_cpu_cache_all(void)
+ {
++    /* pi5-v100: flush_cache_all() does not exist on arm64; at least flush registered user pages */
++    if (NV_MAY_SLEEP())
++        nv_pi5_flush_user_pages();
+     on_each_cpu(nv_flush_cache_cpu, NULL, 1);
+     return NV_OK;
+ }
+@@ -1010,6 +1013,11 @@ NV_STATUS NV_API_CALL os_flush_user_cache(void)
+     // although it is possible. For now, just flush the entire cache to be
+     // safe.
+     //
++    // pi5-v100: on arm64 that is a no-op (no flush_cache_all()), so clean +
++    // invalidate the registered user pages (the only cached memory a user
++    // flush is about) by VA.
++    //
++    nv_pi5_flush_user_pages();
+     on_each_cpu(nv_flush_cache_cpu, NULL, 1);
+     return NV_OK;
+ }
+-- 
+2.47.3
+

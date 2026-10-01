@@ -1,0 +1,86 @@
+From f563b880427b97a0740459fb12c8f7f5a95d6831 Mon Sep 17 00:00:00 2001
+From: handrx <287708+handrx@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 19:54:15 +0100
+Subject: [PATCH] pi5-v100: nv_pi5_debug prints for kernel mappings (find the
+ LDXR external abort)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/inc/nv-linux.h | 2 ++
+ nvidia/nv.c           | 9 +++++++++
+ nvidia/os-interface.c | 5 +++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/common/inc/nv-linux.h b/common/inc/nv-linux.h
+index a07bdf8..a88b4c7 100644
+--- a/common/inc/nv-linux.h
++++ b/common/inc/nv-linux.h
+@@ -967,6 +967,7 @@ typedef struct nv_alloc_s {
+         NvBool carveout    : 1;
+     } flags;
+     unsigned int   cache_type;
++    unsigned int   pi5_req_cache;   /* pi5-v100: cache type RM asked for */
+     unsigned int   num_pages;
+     unsigned int   order;
+     unsigned int   size;
+@@ -1749,6 +1750,7 @@ typedef enum
+                                          !NV_IS_EXPORT_SYMBOL_GPL_##symbol)
+ 
+ extern int nv_pi5_no_iomap_wc;
++extern int nv_pi5_debug;
+ #define nv_pi5_disable_iomap_wc() (nv_pi5_no_iomap_wc || rm_disable_iomap_wc())
+ 
+ #endif  /* _NV_LINUX_H_ */
+diff --git a/nvidia/nv.c b/nvidia/nv.c
+index f68c649..1a95ced 100644
+--- a/nvidia/nv.c
++++ b/nvidia/nv.c
+@@ -40,6 +40,9 @@ MODULE_PARM_DESC(nv_pi5_force_uncached, "Map all GPU-shared sysmem uncached (non
+ int nv_pi5_no_iomap_wc = 1;
+ module_param(nv_pi5_no_iomap_wc, int, 0444);
+ MODULE_PARM_DESC(nv_pi5_no_iomap_wc, "Never map GPU MMIO write-combined");
++int nv_pi5_debug = 0;
++module_param(nv_pi5_debug, int, 0644);
++MODULE_PARM_DESC(nv_pi5_debug, "Log sysmem allocations and kernel mappings (unhashed)");
+ #include "nv-p2p.h"
+ #include "nv-reg.h"
+ #include "nv-msi.h"
+@@ -3757,6 +3760,11 @@ void* NV_API_CALL nv_alloc_kernel_mapping(
+             return NULL;
+         }
+ 
++        if (nv_pi5_debug)
++            printk(KERN_INFO "NVRM: pi5dbg: kmap %px +%u pages at=%px cache=%u(req %u) contig=%d %pS\n",
++                   (void *)virt_addr, page_count, at, at->cache_type, at->pi5_req_cache,
++                   at->flags.contig, __builtin_return_address(0));
++
+         *pPrivate = (void *)(NvUPtr)page_count;
+         return (void *)(virt_addr + pageOffset);
+     }
+@@ -3857,6 +3865,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
+         return NV_ERR_NO_MEMORY;
+ 
+     at->cache_type = cache_type;
++    at->pi5_req_cache = cache_type;
+ #if defined(NVCPU_AARCH64)
+     if (nv_pi5_force_uncached && at->cache_type == NV_MEMORY_CACHED)
+         at->cache_type = NV_MEMORY_UNCACHED;
+diff --git a/nvidia/os-interface.c b/nvidia/os-interface.c
+index c5c0f4b..2648eb2 100644
+--- a/nvidia/os-interface.c
++++ b/nvidia/os-interface.c
+@@ -958,6 +958,11 @@ void* NV_API_CALL os_map_kernel_space(
+             return NULL;
+     }
+ 
++    if (nv_pi5_debug)
++        printk(KERN_INFO "NVRM: pi5dbg: ioremap %px phys=0x%llx size=0x%llx mode=%u %pS\n",
++               vaddr, (unsigned long long)start, (unsigned long long)size_bytes, mode,
++               __builtin_return_address(0));
++
+     return vaddr;
+ }
+ 
+-- 
+2.47.3
+

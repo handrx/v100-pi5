@@ -1,0 +1,8 @@
+user
+In three short bullet points: what is the capital of Australia, what is 17*23, and name the largest planet.
+assistant
+- The capital of Australia is Canberra.
+- 17 multiplied by 23 is 391.
+- The largest planet in our solar system is Jupiter. [end of text]
+
+

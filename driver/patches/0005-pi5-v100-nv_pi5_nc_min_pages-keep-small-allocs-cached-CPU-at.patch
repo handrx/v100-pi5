@@ -1,0 +1,49 @@
+From 67d88ec927ac33dd16bd6362e4c2cbd7dd9a71f6 Mon Sep 17 00:00:00 2001
+From: handrx <287708+handrx@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 20:14:04 +0100
+Subject: [PATCH] pi5-v100: nv_pi5_nc_min_pages - keep small allocs cached (CPU
+ atomics abort on NC)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ nvidia/nv.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/nvidia/nv.c b/nvidia/nv.c
+index 1a95ced..06e3246 100644
+--- a/nvidia/nv.c
++++ b/nvidia/nv.c
+@@ -40,6 +40,9 @@ MODULE_PARM_DESC(nv_pi5_force_uncached, "Map all GPU-shared sysmem uncached (non
+ int nv_pi5_no_iomap_wc = 1;
+ module_param(nv_pi5_no_iomap_wc, int, 0444);
+ MODULE_PARM_DESC(nv_pi5_no_iomap_wc, "Never map GPU MMIO write-combined");
++int nv_pi5_nc_min_pages = 1;
++module_param(nv_pi5_nc_min_pages, int, 0444);
++MODULE_PARM_DESC(nv_pi5_nc_min_pages, "Only force allocations of at least this many pages uncached (smaller ones stay cached: RM uses CPU atomics, which BCM2712 aborts on NC memory)");
+ int nv_pi5_debug = 0;
+ module_param(nv_pi5_debug, int, 0644);
+ MODULE_PARM_DESC(nv_pi5_debug, "Log sysmem allocations and kernel mappings (unhashed)");
+@@ -3867,7 +3870,8 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
+     at->cache_type = cache_type;
+     at->pi5_req_cache = cache_type;
+ #if defined(NVCPU_AARCH64)
+-    if (nv_pi5_force_uncached && at->cache_type == NV_MEMORY_CACHED)
++    if (nv_pi5_force_uncached && at->cache_type == NV_MEMORY_CACHED &&
++        page_count >= nv_pi5_nc_min_pages)
+         at->cache_type = NV_MEMORY_UNCACHED;
+ #endif
+ 
+@@ -3927,7 +3931,9 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
+     }
+ 
+ #if defined(NVCPU_AARCH64)
+-    if ((dev != NULL) && (at->cache_type != NV_MEMORY_CACHED) && !at->flags.coherent)
++    /* also clean the ones kept cached, so the GPU sees their initial contents */
++    if ((dev != NULL) && !at->flags.coherent &&
++        ((at->cache_type != NV_MEMORY_CACHED) || nv_pi5_force_uncached))
+         nv_pi5_flush_alloc(dev, at);
+ #endif
+ 
+-- 
+2.47.3
+

@@ -1,0 +1,35 @@
+#!/bin/sh
+# V100 on Pi 5: the only way nvidia / nvidia_uvm get loaded (modprobe.d/v100.conf "install" hook,
+# reached via nvidia-modprobe from nvidia-smi / libcuda, or a plain "modprobe nvidia").
+# Refuses unless the v100-pcie overlay is active; a crash marker stops a load that hung the Pi
+# last time from being retried automatically. Docs: /root/v100-pi/REVIEW.md (Step 5).
+#   undo a refusal after a hang:   rm /var/lib/v100/loading
+#   disable at boot:               add v100.noload to /boot/firmware/cmdline.txt
+PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH   # nvidia-modprobe runs modprobe with an empty environment
+M=$1; shift
+MARK=/var/lib/v100/loading
+log() { echo "v100-guard: $*" > /dev/kmsg 2>/dev/null; echo "v100-guard: $*" >&2; }
+loaded() { grep -q "^$1 " /proc/modules; }
+
+if grep -qw v100.noload /proc/cmdline; then log "v100.noload on the kernel cmdline, not loading $M"; exit 1; fi
+if ! od -An -tx4 --endian=big -w64 /proc/device-tree/axi/pcie@1000110000/ranges 2>/dev/null \
+     | tr -s ' \n' ' ' | grep -q "43000000 00000008"; then
+    log "v100-pcie overlay not active (BAR1 can't be placed), not loading $M"; exit 1
+fi
+if [ -e "$MARK" ]; then
+    log "an earlier load did not finish ($(cat "$MARK")): Pi probably hung. Not loading $M; rm $MARK to retry"; exit 1
+fi
+
+mkdir -p "${MARK%/*}"; echo "$M at $(date '+%F %T')" > "$MARK"; sync
+rc=0
+loaded v100_bar || modprobe --ignore-install v100_bar || rc=$?
+if [ $rc -eq 0 ] && ! loaded nvidia; then
+    if [ "$M" = nvidia ]; then modprobe --ignore-install nvidia "$@" || rc=$?
+    else modprobe --ignore-install nvidia || rc=$?; fi
+fi
+if [ $rc -eq 0 ] && [ "$M" = nvidia_uvm ] && ! loaded nvidia_uvm; then
+    modprobe --ignore-install nvidia_uvm "$@" || rc=$?
+fi
+rm -f "$MARK"; sync
+[ $rc -eq 0 ] && log "loaded $M" || log "loading $M failed (rc=$rc)"
+exit $rc

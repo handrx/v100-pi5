@@ -1,0 +1,244 @@
+From 3728361d5a2589fe4130152d3a49ec814e5c0f77 Mon Sep 17 00:00:00 2001
+From: handrx <287708+handrx@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 20:26:21 +0100
+Subject: [PATCH] pi5-v100: force RM sysmem allocations made for UVM uncached
+ regardless of nv_pi5_nc_min_pages
+
+UVM's semaphore pages are 1 page; nc_min_pages=2 kept them cached, so the CPU
+polled a stale cached value while the CE's release went to DRAM: UVM hung in
+channel_pool_add -> uvm_push_end_and_wait on GPU registration. The calling task
+is marked around the allocating nvUvmInterface* calls (nv_pi5_uvm_uncached=1).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/inc/nv-linux.h     |  2 ++
+ nvidia/nv.c               | 60 ++++++++++++++++++++++++++++++++++++++-
+ nvidia/nv_uvm_interface.c | 18 ++++++++++++
+ 3 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/common/inc/nv-linux.h b/common/inc/nv-linux.h
+index a88b4c7..3bb05f6 100644
+--- a/common/inc/nv-linux.h
++++ b/common/inc/nv-linux.h
+@@ -1751,6 +1751,8 @@ typedef enum
+ 
+ extern int nv_pi5_no_iomap_wc;
+ extern int nv_pi5_debug;
++int  nv_pi5_uvm_mark(void);
++void nv_pi5_uvm_unmark(int slot);
+ #define nv_pi5_disable_iomap_wc() (nv_pi5_no_iomap_wc || rm_disable_iomap_wc())
+ 
+ #endif  /* _NV_LINUX_H_ */
+diff --git a/nvidia/nv.c b/nvidia/nv.c
+index 06e3246..67f1b4d 100644
+--- a/nvidia/nv.c
++++ b/nvidia/nv.c
+@@ -46,6 +46,59 @@ MODULE_PARM_DESC(nv_pi5_nc_min_pages, "Only force allocations of at least this m
+ int nv_pi5_debug = 0;
+ module_param(nv_pi5_debug, int, 0644);
+ MODULE_PARM_DESC(nv_pi5_debug, "Log sysmem allocations and kernel mappings (unhashed)");
++int nv_pi5_uvm_uncached = 1;
++module_param(nv_pi5_uvm_uncached, int, 0444);
++MODULE_PARM_DESC(nv_pi5_uvm_uncached, "Force sysmem RM allocates for UVM uncached regardless of nv_pi5_nc_min_pages (UVM's 1-page semaphore pages)");
++
++/*
++ * pi5-v100: tasks currently inside a UVM->RM call that allocates sysmem for UVM
++ * (nv_uvm_interface.c). nv_alloc_pages forces those allocations uncached even
++ * below nv_pi5_nc_min_pages: UVM's semaphore pages are 1 page, the GPU writes
++ * them and the CPU polls them, which never completes on a cached mapping.
++ */
++#define NV_PI5_UVM_SLOTS 16
++static struct task_struct *nv_pi5_uvm_tasks[NV_PI5_UVM_SLOTS];
++static DEFINE_SPINLOCK(nv_pi5_uvm_lock);
++
++int nv_pi5_uvm_mark(void)
++{
++    unsigned long flags;
++    int i;
++
++    spin_lock_irqsave(&nv_pi5_uvm_lock, flags);
++    for (i = 0; i < NV_PI5_UVM_SLOTS; i++)
++    {
++        if (nv_pi5_uvm_tasks[i] == NULL)
++        {
++            WRITE_ONCE(nv_pi5_uvm_tasks[i], current);
++            break;
++        }
++    }
++    spin_unlock_irqrestore(&nv_pi5_uvm_lock, flags);
++
++    if (i == NV_PI5_UVM_SLOTS)
++    {
++        printk_once(KERN_WARNING "NVRM: pi5: out of UVM marker slots, an allocation may stay cached\n");
++        return -1;
++    }
++    return i;
++}
++
++void nv_pi5_uvm_unmark(int slot)
++{
++    if (slot >= 0)
++        WRITE_ONCE(nv_pi5_uvm_tasks[slot], NULL);
++}
++
++static NvBool nv_pi5_in_uvm_call(void)
++{
++    int i;
++
++    for (i = 0; i < NV_PI5_UVM_SLOTS; i++)
++        if (READ_ONCE(nv_pi5_uvm_tasks[i]) == current)
++            return NV_TRUE;
++    return NV_FALSE;
++}
+ #include "nv-p2p.h"
+ #include "nv-reg.h"
+ #include "nv-msi.h"
+@@ -3871,8 +3924,13 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
+     at->pi5_req_cache = cache_type;
+ #if defined(NVCPU_AARCH64)
+     if (nv_pi5_force_uncached && at->cache_type == NV_MEMORY_CACHED &&
+-        page_count >= nv_pi5_nc_min_pages)
++        (page_count >= nv_pi5_nc_min_pages ||
++         (nv_pi5_uvm_uncached && nv_pi5_in_uvm_call())))
++    {
+         at->cache_type = NV_MEMORY_UNCACHED;
++        if (nv_pi5_debug && page_count < nv_pi5_nc_min_pages)
++            printk(KERN_INFO "NVRM: pi5dbg: UVM alloc +%u pages forced uncached\n", page_count);
++    }
+ #endif
+ 
+     if (contiguous)
+diff --git a/nvidia/nv_uvm_interface.c b/nvidia/nv_uvm_interface.c
+index deceaab..8df89a3 100644
+--- a/nvidia/nv_uvm_interface.c
++++ b/nvidia/nv_uvm_interface.c
+@@ -357,6 +357,7 @@ NV_STATUS nvUvmInterfaceMemoryAllocSys(uvmGpuAddressSpaceHandle vaSpace,
+                     UvmGpuAllocInfo * allocInfo)
+ {
+     nvidia_stack_t *sp = NULL;
++    int pi5_slot;
+     NV_STATUS status;
+ 
+     if (nv_kmem_cache_alloc_stack(&sp) != 0)
+@@ -364,10 +365,12 @@ NV_STATUS nvUvmInterfaceMemoryAllocSys(uvmGpuAddressSpaceHandle vaSpace,
+         return NV_ERR_NO_MEMORY;
+     }
+ 
++    pi5_slot = nv_pi5_uvm_mark();   /* pi5-v100: allocs for UVM -> uncached */
+     status = rm_gpu_ops_memory_alloc_sys(
+              sp, (gpuAddressSpaceHandle)vaSpace,
+              length, (NvU64 *) gpuPointer,
+              allocInfo);
++    nv_pi5_uvm_unmark(pi5_slot);
+ 
+     nv_kmem_cache_free_stack(sp);
+     return status;
+@@ -556,6 +559,7 @@ NV_STATUS nvUvmInterfaceTsgAllocate(uvmGpuAddressSpaceHandle vaSpace,
+                                     uvmGpuTsgHandle *tsg)
+ {
+     nvidia_stack_t *sp = NULL;
++    int pi5_slot;
+     NV_STATUS status;
+ 
+     if (nv_kmem_cache_alloc_stack(&sp) != 0)
+@@ -563,10 +567,12 @@ NV_STATUS nvUvmInterfaceTsgAllocate(uvmGpuAddressSpaceHandle vaSpace,
+         return NV_ERR_NO_MEMORY;
+     }
+ 
++    pi5_slot = nv_pi5_uvm_mark();   /* pi5-v100: allocs for UVM -> uncached */
+     status = rm_gpu_ops_tsg_allocate(sp,
+                                      (gpuAddressSpaceHandle)vaSpace,
+                                      allocParams,
+                                      (gpuTsgHandle *)tsg);
++    nv_pi5_uvm_unmark(pi5_slot);
+ 
+     nv_kmem_cache_free_stack(sp);
+ 
+@@ -589,6 +595,7 @@ NV_STATUS nvUvmInterfaceChannelAllocate(const uvmGpuTsgHandle tsg,
+                                         UvmGpuChannelInfo *channelInfo)
+ {
+     nvidia_stack_t *sp = NULL;
++    int pi5_slot;
+     NV_STATUS status;
+ 
+     if (nv_kmem_cache_alloc_stack(&sp) != 0)
+@@ -596,11 +603,13 @@ NV_STATUS nvUvmInterfaceChannelAllocate(const uvmGpuTsgHandle tsg,
+         return NV_ERR_NO_MEMORY;
+     }
+ 
++    pi5_slot = nv_pi5_uvm_mark();   /* pi5-v100: allocs for UVM -> uncached */
+     status = rm_gpu_ops_channel_allocate(sp,
+                                          (gpuTsgHandle)tsg,
+                                          allocParams,
+                                          (gpuChannelHandle *)channel,
+                                          channelInfo);
++    nv_pi5_uvm_unmark(pi5_slot);
+ 
+     nv_kmem_cache_free_stack(sp);
+ 
+@@ -850,6 +859,7 @@ NV_STATUS nvUvmInterfaceInitFaultInfo(uvmGpuDeviceHandle device,
+                                       UvmGpuFaultInfo *pFaultInfo)
+ {
+     nvidia_stack_t *sp = NULL;
++    int pi5_slot;
+     NV_STATUS status;
+     int err;
+ 
+@@ -858,9 +868,11 @@ NV_STATUS nvUvmInterfaceInitFaultInfo(uvmGpuDeviceHandle device,
+         return NV_ERR_NO_MEMORY;
+     }
+ 
++    pi5_slot = nv_pi5_uvm_mark();   /* pi5-v100: allocs for UVM -> uncached */
+     status = rm_gpu_ops_init_fault_info(sp,
+                                        (gpuDeviceHandle)device,
+                                        pFaultInfo);
++    nv_pi5_uvm_unmark(pi5_slot);
+     if (status != NV_OK)
+     {
+         goto done;
+@@ -914,6 +926,7 @@ NV_STATUS nvUvmInterfaceInitAccessCntrInfo(uvmGpuDeviceHandle device,
+                                            NvU32 accessCntrIndex)
+ {
+     nvidia_stack_t *sp = NULL;
++    int pi5_slot;
+     NV_STATUS status;
+ 
+     if (nv_kmem_cache_alloc_stack(&sp) != 0)
+@@ -921,10 +934,12 @@ NV_STATUS nvUvmInterfaceInitAccessCntrInfo(uvmGpuDeviceHandle device,
+         return NV_ERR_NO_MEMORY;
+     }
+ 
++    pi5_slot = nv_pi5_uvm_mark();   /* pi5-v100: allocs for UVM -> uncached */
+     status = rm_gpu_ops_init_access_cntr_info(sp,
+                                               (gpuDeviceHandle)device,
+                                               pAccessCntrInfo,
+                                               accessCntrIndex);
++    nv_pi5_uvm_unmark(pi5_slot);
+ 
+     nv_kmem_cache_free_stack(sp);
+     return status;
+@@ -1483,6 +1498,7 @@ NV_STATUS nvUvmInterfacePagingChannelAllocate(uvmGpuDeviceHandle device,
+                                               UvmGpuPagingChannelInfo *channelInfo)
+ {
+     nvidia_stack_t *sp = NULL;
++    int pi5_slot;
+     nvidia_stack_t *pushStreamSp = NULL;
+     NV_STATUS status;
+ 
+@@ -1495,11 +1511,13 @@ NV_STATUS nvUvmInterfacePagingChannelAllocate(uvmGpuDeviceHandle device,
+         return NV_ERR_NO_MEMORY;
+     }
+ 
++    pi5_slot = nv_pi5_uvm_mark();   /* pi5-v100: allocs for UVM -> uncached */
+     status = rm_gpu_ops_paging_channel_allocate(sp,
+                                                 (gpuDeviceHandle)device,
+                                                 allocParams,
+                                                 (gpuPagingChannelHandle *)channel,
+                                                 channelInfo);
++    nv_pi5_uvm_unmark(pi5_slot);
+ 
+     if (status == NV_OK)
+         (*channel)->pushStreamSp = pushStreamSp;
+-- 
+2.47.3
+

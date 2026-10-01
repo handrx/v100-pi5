@@ -1,0 +1,25 @@
+From 3bb679631c1723d3c92c22e47b648d3aac30f412 Mon Sep 17 00:00:00 2001
+From: handrx <287708+handrx@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 14:44:32 +0100
+Subject: [PATCH] dkms.conf
+
+---
+ dkms.conf | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dkms.conf b/dkms.conf
+index fe581f7..4714b68 100644
+--- a/dkms.conf
++++ b/dkms.conf
+@@ -1,7 +1,7 @@
+ PACKAGE_NAME="nvidia"
+ PACKAGE_VERSION="580.95.05-v100"
+ AUTOINSTALL="yes"
+-MAKE[0]="'make' -j$(nproc) SYSSRC=${kernel_source_dir} IGNORE_CC_MISMATCH=1 modules"
++MAKE[0]="'make' -j$(nproc) SYSSRC=/lib/modules/${kernelver}/source SYSOUT=/lib/modules/${kernelver}/build IGNORE_CC_MISMATCH=1 modules"
+ CLEAN="make clean"
+ BUILT_MODULE_NAME[0]="nvidia"
+ DEST_MODULE_LOCATION[0]="/kernel/drivers/video"
+-- 
+2.47.3
+

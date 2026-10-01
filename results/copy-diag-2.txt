@@ -1,0 +1,24 @@
+N=64 KB
+  D2H pageable (memset): OK
+  D2H pinned   (memset): OK
+  H2D pageable -> D2H pinned: OK
+  H2D pinned -> D2H pageable: OK
+    same D2H pageable again : OK
+N=1024 KB
+  D2H pageable (memset): OK
+  D2H pinned   (memset): OK
+  H2D pageable -> D2H pinned: OK
+  H2D pinned -> D2H pageable: OK
+    same D2H pageable again : OK
+N=16384 KB
+  D2H pageable (memset): OK
+  D2H pinned   (memset): OK
+  H2D pageable -> D2H pinned: OK
+  H2D pinned -> D2H pageable: OK
+    same D2H pageable again : OK
+N=65536 KB
+  D2H pageable (memset): OK
+  D2H pinned   (memset): OK
+  H2D pageable -> D2H pinned: OK
+  H2D pinned -> D2H pageable: OK
+    same D2H pageable again : OK

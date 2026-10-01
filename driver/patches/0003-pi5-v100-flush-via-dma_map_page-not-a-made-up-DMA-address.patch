@@ -1,0 +1,53 @@
+From 19763e53135fb0a23f4a7913c342aba25b20d9aa Mon Sep 17 00:00:00 2001
+From: handrx <287708+handrx@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 19:40:27 +0100
+Subject: [PATCH] pi5-v100: flush via dma_map_page, not a made-up DMA address
+
+nv_phys_to_dma() returns the CPU address here (no phys_to_dma), which is
+outside the Pi 5 dma-ranges, so dma_sync_single_* faulted in
+dcache_clean_inval_poc during rm_init_adapter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ nvidia/nv.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/nvidia/nv.c b/nvidia/nv.c
+index b7fbbdf..f68c649 100644
+--- a/nvidia/nv.c
++++ b/nvidia/nv.c
+@@ -3789,17 +3789,27 @@ void NV_API_CALL nv_free_kernel_mapping(
+ }
+ 
+ #if defined(NVCPU_AARCH64)
+-/* Clean + invalidate the linear-map alias of every page in the allocation. */
++/*
++ * Clean + invalidate the linear-map alias of every page in the allocation.
++ * Map/unmap each page rather than syncing a made-up DMA address: without
++ * phys_to_dma() nv_phys_to_dma() returns the CPU address, which is outside
++ * the Pi 5 dma-ranges (RAM is at bus 0x10_0000_0000) and syncing it faults.
++ */
+ static void nv_pi5_flush_alloc(struct device *dev, nv_alloc_t *at)
+ {
+     NvU64 i;
+ 
+     for (i = 0; i < at->num_pages; i++)
+     {
+-        dma_addr_t da = nv_phys_to_dma(dev, at->page_table[i].phys_addr);
++        unsigned long pfn = at->page_table[i].phys_addr >> PAGE_SHIFT;
++        dma_addr_t da;
++
++        if (!pfn_valid(pfn))
++            continue;
+ 
+-        dma_sync_single_for_device(dev, da, PAGE_SIZE, DMA_BIDIRECTIONAL);
+-        dma_sync_single_for_cpu(dev, da, PAGE_SIZE, DMA_BIDIRECTIONAL);
++        da = dma_map_page(dev, pfn_to_page(pfn), 0, PAGE_SIZE, DMA_BIDIRECTIONAL);
++        if (!dma_mapping_error(dev, da))
++            dma_unmap_page(dev, da, PAGE_SIZE, DMA_BIDIRECTIONAL);
+     }
+ }
+ #endif
+-- 
+2.47.3
+

@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Remap the Pi 5 external PCIe (pcie1) 64-bit prefetchable window from bus
+ * 0x4_0000_0000 to bus 0x8_0000_0000 so a V100's fixed 32GB BAR1 can be placed
+ * there (BARs must be naturally aligned). CPU side and size are unchanged.
+ */
+/ {
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&pcie1>;
+		__overlay__ {
+			ranges = <0x02000000 0x00 0x80000000  0x1b 0x80000000  0x00 0x80000000>,
+				 <0x43000000 0x08 0x00000000  0x18 0x00000000  0x03 0x80000000>;
+		};
+	};
+};
