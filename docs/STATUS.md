@@ -1,3 +1,4 @@
+# 2026-10-01 ~22:20 (Pi clock): vram-fill.py: CUDA allocates 31 x 1 GiB (31.73 GiB total, 31.43 free after ctx, 438 MiB left), memset per chunk + 93 readback probes all OK, no Xid. BAR1=8G does not limit usable VRAM.
 # 2026-10-01 ~22:00 (Pi clock; `date` said 21:42, clock lags): STEP 5 VERIFIED after a NORMAL reboot. The V100 setup is now permanent.
 - tryboot=0 (normal config.txt), pcie@1000110000 ranges 2nd entry 43000000 00000008 (overlay applied). Nothing nvidia at boot;
   first load at 186 s, ~7 s after the user's root login (on demand via v100-guard: v100_bar, nvidia, nvidia_uvm). No marker left.
